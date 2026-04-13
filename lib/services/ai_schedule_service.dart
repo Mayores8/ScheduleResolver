@@ -9,6 +9,7 @@ class AiScheduleService extends ChangeNotifier {
   bool _isLoading = false;
   String? _errorMessage;
 
+
   final String _apiKey = '';
 
   ScheduleAnalysis? get currentAnalysis => _currentAnalysis;
@@ -16,13 +17,36 @@ class AiScheduleService extends ChangeNotifier {
   String? get errorMessage => _errorMessage;
 
   Future<void> analyzeSchedule(List<TaskModel> tasks) async {
-    if (_apiKey.isEmpty || tasks.isEmpty) return;
+    if (tasks.isEmpty) {
+      _errorMessage = "No tasks provided.";
+      notifyListeners();
+      return;
+    }
+
     _isLoading = true;
     _errorMessage = null;
     notifyListeners();
 
     try {
-      final model = GenerativeModel(model: 'gemini-2.5-flash', apiKey: _apiKey);
+      final localConflicts = _detectConflicts(tasks);
+
+      if (_apiKey.isEmpty) {
+        _currentAnalysis = ScheduleAnalysis(
+          conflicts: localConflicts.isEmpty
+              ? "No conflicts detected ✅"
+              : localConflicts.join('\n'),
+          rankedTasks: "AI ranking unavailable (no API key)",
+          recommendedSchedule: "AI suggestions unavailable",
+          explanation: "Add your API key to enable AI features.",
+        );
+        return;
+      }
+
+      final model = GenerativeModel(
+        model: 'gemini-1.5-flash',
+        apiKey: _apiKey,
+      );
+
       final taskJson = jsonEncode(tasks.map((t) => t.toJson()).toList());
 
       final prompt = '''
@@ -46,37 +70,109 @@ class AiScheduleService extends ChangeNotifier {
       Ensure the markdown is well-formatted and easy to read. Do not include extra text outside of these headers.
       ''';
 
-      final content = [Content.text(prompt)];
-      final response = await model.generateContent(content);
+      final response = await model
+          .generateContent([
+        Content.text(prompt)
+      ])
+          .timeout(const Duration(seconds: 20));
 
-      _currentAnalysis = _parseResponse(response.text ?? '');
+      // 🔍 DEBUG OUTPUT
+      print("========== GEMINI RAW RESPONSE ==========");
+      print(response.text);
+      print("=========================================");
 
+      final text = response.text?.trim() ?? '';
 
-    } catch(e) {
-      _errorMessage = 'Failed: \$e';
+      if (text.isEmpty || !text.contains('###')) {
+        _currentAnalysis = ScheduleAnalysis(
+          conflicts: localConflicts.isEmpty
+              ? "No conflicts detected ✅"
+              : localConflicts.join('\n'),
+          rankedTasks: "AI failed to rank tasks",
+          recommendedSchedule: "AI failed to generate schedule",
+          explanation: "The AI response was empty or malformed.",
+        );
+      } else {
+        _currentAnalysis = _parseResponse(text, localConflicts);
+      }
+
+    } catch (e) {
+      _errorMessage = 'AI Error: $e';
+
+      final localConflicts = _detectConflicts(tasks);
+
+      _currentAnalysis = ScheduleAnalysis(
+        conflicts: localConflicts.isEmpty
+            ? "No conflicts detected ✅"
+            : localConflicts.join('\n'),
+        rankedTasks: "AI unavailable",
+        recommendedSchedule: "AI unavailable",
+        explanation: "Using fallback logic due to error.",
+      );
     } finally {
       _isLoading = false;
       notifyListeners();
-
     }
   }
 
-  ScheduleAnalysis _parseResponse (String fulltext) {
-    String conflicts = "", rankedTasks = "", recommendedSchedule = "", explanation = "";
+  List<String> _detectConflicts(List<TaskModel> tasks) {
+    List<String> conflicts = [];
 
-    final sections = fulltext.split('###');
-    for (var section in sections) {
-      if (section.startsWith('Detected Conflicts')) conflicts = section.replaceFirst('Detected Conflicts', '').trim();
-      else if (section.startsWith('Ranked Tasks')) rankedTasks = section.replaceFirst('Ranked Tasks', '').trim();
-      else if (section.startsWith('Recommended Schedule')) recommendedSchedule = section.replaceFirst('Recommended Schedule', '').trim();
-      else if (section.startsWith('Explanation')) explanation = section.replaceFirst('Explanation', '').trim();
+    for (int i = 0; i < tasks.length; i++) {
+      for (int j = i + 1; j < tasks.length; j++) {
+        final a = tasks[i];
+        final b = tasks[j];
+
+        if (_isOverlapping(a, b)) {
+          conflicts.add("${a.title} overlaps with ${b.title}");
+        }
+      }
+    }
+
+    return conflicts;
+  }
+
+  bool _isOverlapping(TaskModel a, TaskModel b) {
+    return a.startTime.isBefore(b.endTime) &&
+        b.startTime.isBefore(a.endTime);
+  }
+
+  ScheduleAnalysis _parseResponse(String text, List<String> fallbackConflicts) {
+    String conflicts = "";
+    String rankedTasks = "";
+    String recommendedSchedule = "";
+    String explanation = "";
+
+    final regex = RegExp(r'###\s*(.*?)\n([\s\S]*?)(?=###|$)');
+    final matches = regex.allMatches(text);
+
+    for (final match in matches) {
+      final title = match.group(1)?.toLowerCase() ?? '';
+      final content = match.group(2)?.trim() ?? '';
+
+      if (title.contains('conflict')) {
+        conflicts = content;
+      } else if (title.contains('rank')) {
+        rankedTasks = content;
+      } else if (title.contains('recommended')) {
+        recommendedSchedule = content;
+      } else if (title.contains('explanation')) {
+        explanation = content;
+      }
+    }
+
+    if (conflicts.isEmpty) {
+      conflicts = fallbackConflicts.isEmpty
+          ? "No conflicts detected ✅"
+          : fallbackConflicts.join('\n');
     }
 
     return ScheduleAnalysis(
       conflicts: conflicts,
-      rankedTasks: rankedTasks,
-      recommendedSchedule: recommendedSchedule,
-      explanation: explanation,
+      rankedTasks: rankedTasks.isEmpty ? "Not provided" : rankedTasks,
+      recommendedSchedule:
+      recommendedSchedule.isEmpty ? "Not provided" : recommendedSchedule,
+      explanation: explanation.isEmpty ? "Not provided" : explanation,
     );
   }
 }
